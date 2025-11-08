@@ -132,7 +132,7 @@ def create_tables(connection):
                print(f"Error reading CSV file: {e}")
                return[]
           
-          def main():
+def main():
                '''Main function to setup database and populate with data'''
                csv_file_path = 'user_data.csv'
                #step 1 : Connect to MySQL server
@@ -184,7 +184,7 @@ def create_tables(connection):
         {'user_id': str(uuid.uuid4()), 'name': 'Alice Williams', 'email': 'alice.w@example.com', 'age': '29.75'},
         {'user_id': str(uuid.uuid4()), 'name': 'Charlie Brown', 'email': 'charlie.b@example.com', 'age': '52.00'},
     ]
-          try:
+                try:
                              with open(file_path, 'w', newline='', encoding='utf-8') as csv_file:
                                   fieldnames = ['user_id', 'name','email', 'age']
                                   writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -193,7 +193,7 @@ def create_tables(connection):
                                   writer.writerows(sample_data)
                              print(f"sample CSV file created:{file_path}")
 
-          except Exception as e:
+                except Exception as e:
                              print(f"Error creating sample CSV file:{e}")  
 if __name__ =="__main__":
      main()                 
