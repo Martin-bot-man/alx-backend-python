@@ -12,15 +12,16 @@ def with_db_connection(func):
            conn.close()
     return wrapper
 
-def transational(func):
+def transactional(func):
    @functools.wraps(func)
    def wrapper(conn, *args, **kwargs):
-        try:
-           conn.execute("BEGIN")
-           result = func(conn, *args, **kwargs)
-            conn.execute("COMMIT")
-              return result
-        except Exception as e:
+    try:
+        conn.execute("BEGIN")
+        result = func(conn, *args, **kwargs)
+        conn.execute("COMMIT")
+              
+        return result
+    except Exception as e:
                 conn.execute("ROLLBACK")
                 print(f"Transaction failed: {e}")
                 raise
