@@ -12,6 +12,18 @@ def with_db_connection(func):
            conn.close()
     return wrapper
 
+def transational(func):
+   @functools.wraps(func)
+   def wrapper(conn, *args, **kwargs):
+        try:
+           conn.execute("BEGIN")
+           result = func(conn, *args, **kwargs)
+            conn.execute("COMMIT")
+              return result
+        except Exception as e:
+                conn.execute("ROLLBACK")
+                print(f"Transaction failed: {e}")
+                raise
 @with_db_connection
 def get_user_by_id(conn, user_id):
     cursor = conn.cursor()
@@ -20,29 +32,13 @@ def get_user_by_id(conn, user_id):
 #### Fetch user by ID with automatic connection handling 
 
 @with_db_connection
-@get_user_by_id
-def transactional(func):
-   @functools.wraps(func)
-   def wrapper(conn, *args, **kwargs):
-      try:
-         conn.execute("BEGIN")
-         result = func(conn, *args, **kwargs)
-         conn.execute("COMMIT")
-         return result
-      except Exception as e:
-         conn.execute("ROLLBACK")
-         print(f"Transaction failed: {e}")
-         raise
-   return wrapper
-
-user = get_user_by_id(user_id=1)
-print(user)
-@with_db_connection
 @transactional
 def create_user(conn, username, email):
     cursor = conn.cursor()
     cursor.execute("INSERT INTO users (username, email) VALUES (?, ?)", (username, email))
     return cursor.lastrowid
+
+@with_db_connection
 @transactional 
 def update_user_email(conn, user_id, new_email): 
  cursor = conn.cursor() 
