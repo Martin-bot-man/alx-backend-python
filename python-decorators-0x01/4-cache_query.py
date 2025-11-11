@@ -17,11 +17,12 @@ def with_db_connection(func):
             return wrapper
 
 #### cache_query decorator
-# Caches the results of SQL queries to avoid redundant database hits        
+# Caches the results of SQL queries to avoid redundant database hits
+@with_db_connection
 def cache_query(func):
     @functools.wraps(func)
     def wrapper(conn, query, *args, **kwargs):
-        if query in query  _cache:
+        if query in query _cache:
             print("Fetching result from cache.")
             return query_cache[query]
         else:
