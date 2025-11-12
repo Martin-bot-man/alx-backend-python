@@ -16,15 +16,13 @@ def transactional(func):
    @functools.wraps(func)
    def wrapper(conn, *args, **kwargs):
     try:
-        conn.execute("BEGIN")
         result = func(conn, *args, **kwargs)
-        conn.execute("COMMIT")
-              
+        conn.commit()      
         return result
     except Exception as e:
-                conn.execute("ROLLBACK")
-                print(f"Transaction failed: {e}")
-                raise
+        conn.rollback()
+        print(f"Transaction failed: {e}")
+        raise
 @with_db_connection
 def get_user_by_id(conn, user_id):
     cursor = conn.cursor()
