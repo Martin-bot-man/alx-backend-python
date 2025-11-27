@@ -120,7 +120,7 @@ class ConversationViewSet(viewsets.ModelViewSet):
         # Check if user is a participant
         if request.user not in conversation.participants.all():
             return Response(
-                {'error': 'You are not a participant in this conversation.'},
+                {'error': 'You are not a participant.'},
                 status=status.HTTP_403_FORBIDDEN
             )
         
