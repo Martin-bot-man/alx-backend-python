@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+
+echo "kurbeScript – Starting your Kubernetes cluster"
+echo "===================================================="
+
+# Install Minikube if missing
+if ! command -v minikube >/dev/null 2>&1; then
+    echo "Minikube not found → installing..."
+    curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+    sudo install minikube-linux-amd64 /usr/local/bin/minikube
+    rm minikube-linux-amd64
+    echo "Minikube installed!"
+else
+    echo "Minikube already installed"
+fi
+
+echo
+echo "Starting cluster (be patient, first time takes ~2 minutes)..."
+minikube start --driver=docker --cpus=4 --memory=8192 --addons=ingress
+
+echo
+echo "Verifying cluster..."
+minikube kubectl -- cluster-info
+
+echo
+echo "Listing all pods..."
+minikube kubectl -- get pods --all-namespaces -o wide
+
+echo
+echo "SUCCESS! Your Kubernetes cluster is ready."
+echo "Run 'minikube dashboard' anytime to see the pretty web UI"
