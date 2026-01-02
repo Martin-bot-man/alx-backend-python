@@ -1,8 +1,12 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from django.db.models import Q, Max
+from rest_framework.pagination import PageNumberPagination
+from django_filters.rest_framework import DjangoFilterBackend
+from django.db.models import Q, Max, Prefetch
+from django.shortcuts import get_object_or_404
+
 from .models import User, Conversation, Message
 from .serializers import (
     UserSerializer,
@@ -12,201 +16,172 @@ from .serializers import (
     MessageSerializer,
     MessageCreateSerializer,
 )
+from .permissions import IsConversationParticipant, IsMessageOwner
+
+
+class StandardResultsSetPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
 
 
 class UserViewSet(viewsets.ModelViewSet):
     """
     ViewSet for User operations.
-    Provides CRUD operations for users.
+    Provides CRUD operations for users with search and filtering.
     """
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
     lookup_field = 'user_id'
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ['role']
+    search_fields = ['username', 'email', 'first_name', 'last_name']
+    ordering_fields = ['created_at', 'username']
+    ordering = ['-created_at']
+    pagination_class = StandardResultsSetPagination
     
     def get_queryset(self):
-        """
-        Optionally filter users by role or search term.
-        """
-        queryset = User.objects.all()
-        role = self.request.query_params.get('role', None)
-        search = self.request.query_params.get('search', None)
-        
-        if role:
-            queryset = queryset.filter(role=role)
-        
-        if search:
-            queryset = queryset.filter(
-                Q(username__icontains=search) |
-                Q(email__icontains=search) |
-                Q(first_name__icontains=search) |
-                Q(last_name__icontains=search)
-            )
-        
-        return queryset
+        """Optimize queries by selecting only necessary fields."""
+        return User.objects.all()
     
     @action(detail=False, methods=['get'])
     def me(self, request):
-        """
-        Get current authenticated user's profile.
-        """
+        """Get current authenticated user's profile."""
         serializer = self.get_serializer(request.user)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def active(self, request):
+        """Get all active users (non-admin filter example)."""
+        queryset = self.get_queryset().filter(role__in=['user', 'moderator'])
+        serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 
 
 class ConversationViewSet(viewsets.ModelViewSet):
     """
     ViewSet for Conversation operations.
-    Provides endpoints to list, create, retrieve, update, and delete conversations.
+    Provides endpoints to manage conversations with proper permissions.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsConversationParticipant]
     lookup_field = 'conversation_id'
+    pagination_class = StandardResultsSetPagination
     
     def get_queryset(self):
-        """
-        Return conversations where the current user is a participant.
-        """
+        """Return conversations where current user is a participant."""
         user = self.request.user
-        return Conversation.objects.filter(participants=user).prefetch_related(
+        return Conversation.objects.filter(
+            participants=user
+        ).prefetch_related(
             'participants',
-            'messages',
-            'messages__sender'
+            Prefetch(
+                'messages',
+                queryset=Message.objects.select_related('sender').order_by('-sent_at')[:10]
+            )
+        ).annotate(
+            last_message_time=Max('messages__sent_at')
         ).distinct()
     
     def get_serializer_class(self):
-        """
-        Use different serializers for list and detail views.
-        """
+        """Use different serializers for different actions."""
         if self.action == 'list':
             return ConversationListSerializer
         return ConversationSerializer
     
     def create(self, request, *args, **kwargs):
-        """
-        Create a new conversation with participants.
-        Automatically adds the creator as a participant.
-        """
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
-        # Get participant IDs from request
+        """Create a new conversation with participants."""
         participant_ids = request.data.get('participant_ids', [])
         
-        # Ensure current user is included in participants
+        # Ensure current user is included
         if request.user.user_id not in participant_ids:
-            participant_ids.append(request.user.user_id)
+            participant_ids.append(str(request.user.user_id))
         
         # Validate minimum participants
         if len(participant_ids) < 2:
             return Response(
-                {'error': 'A conversation must have at least 2 participants.'},
+                {'detail': 'A conversation must have at least 2 participants.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Create conversation
-        conversation = Conversation.objects.create()
-        conversation.participants.set(participant_ids)
-        
-        # Return serialized conversation
-        output_serializer = ConversationSerializer(conversation)
-        return Response(output_serializer.data, status=status.HTTP_201_CREATED)
-    
-    def retrieve(self, request, *args, **kwargs):
-        """
-        Retrieve a specific conversation with all messages.
-        """
-        conversation = self.get_object()
-        
-        # Check if user is a participant
-        if request.user not in conversation.participants.all():
+        # Validate all users exist
+        users = User.objects.filter(user_id__in=participant_ids)
+        if users.count() != len(participant_ids):
             return Response(
-                {'error': 'You are not a participant.'},
-                status=status.HTTP_403_FORBIDDEN
+                {'detail': 'One or more participants do not exist.'},
+                status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Create conversation and add participants
+        conversation = Conversation.objects.create()
+        conversation.participants.set(users)
+        
+        serializer = self.get_serializer(conversation)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    
+    def retrieve(self, request, *args, **kwargs):
+        """Retrieve a specific conversation with permission check."""
+        conversation = self.get_object()
         serializer = self.get_serializer(conversation)
         return Response(serializer.data)
     
     @action(detail=True, methods=['post'])
     def add_participant(self, request, conversation_id=None):
-        """
-        Add a new participant to an existing conversation.
-        """
+        """Add a new participant to a conversation."""
         conversation = self.get_object()
-        
-        # Check if requester is a participant
-        if request.user not in conversation.participants.all():
-            return Response(
-                {'error': 'You are not a participant in this conversation.'},
-                status=status.HTTP_403_FORBIDDEN
-            )
         
         user_id = request.data.get('user_id')
         if not user_id:
             return Response(
-                {'error': 'user_id is required.'},
+                {'detail': 'user_id is required.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            user = User.objects.get(user_id=user_id)
-            conversation.participants.add(user)
-            serializer = self.get_serializer(conversation)
-            return Response(serializer.data, status=status.HTTP_200_OK)
-        except User.DoesNotExist:
+        user = get_object_or_404(User, user_id=user_id)
+        
+        if conversation.participants.filter(user_id=user_id).exists():
             return Response(
-                {'error': 'User not found.'},
-                status=status.HTTP_404_NOT_FOUND
+                {'detail': 'User is already a participant.'},
+                status=status.HTTP_400_BAD_REQUEST
             )
+        
+        conversation.participants.add(user)
+        serializer = self.get_serializer(conversation)
+        return Response(serializer.data, status=status.HTTP_200_OK)
     
     @action(detail=True, methods=['post'])
     def remove_participant(self, request, conversation_id=None):
-        """
-        Remove a participant from a conversation.
-        """
+        """Remove a participant from a conversation."""
         conversation = self.get_object()
-        
-        # Check if requester is a participant
-        if request.user not in conversation.participants.all():
-            return Response(
-                {'error': 'You are not a participant in this conversation.'},
-                status=status.HTTP_403_FORBIDDEN
-            )
         
         user_id = request.data.get('user_id')
         if not user_id:
             return Response(
-                {'error': 'user_id is required.'},
+                {'detail': 'user_id is required.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            user = User.objects.get(user_id=user_id)
-            
-            # Prevent removing the last participant
-            if conversation.participants.count() <= 2:
-                return Response(
-                    {'error': 'Cannot remove participant. Conversation must have at least 2 participants.'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            conversation.participants.remove(user)
-            serializer = self.get_serializer(conversation)
-            return Response(serializer.data, status=status.HTTP_200_OK)
-        except User.DoesNotExist:
+        # Prevent removing the last participant
+        if conversation.participants.count() <= 2:
             return Response(
-                {'error': 'User not found.'},
-                status=status.HTTP_404_NOT_FOUND
+                {'detail': 'Conversation must have at least 2 participants.'},
+                status=status.HTTP_400_BAD_REQUEST
             )
+        
+        user = get_object_or_404(User, user_id=user_id)
+        conversation.participants.remove(user)
+        
+        serializer = self.get_serializer(conversation)
+        return Response(serializer.data, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
     def recent(self, request):
-        """
-        Get conversations ordered by most recent message.
-        """
-        conversations = self.get_queryset().annotate(
-            last_message_time=Max('messages__sent_at')
-        ).order_by('-last_message_time')
+        """Get conversations ordered by most recent message."""
+        conversations = self.get_queryset().order_by('-last_message_time')
+        page = self.paginate_queryset(conversations)
+        if page is not None:
+            serializer = ConversationListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = ConversationListSerializer(conversations, many=True)
         return Response(serializer.data)
@@ -215,98 +190,72 @@ class ConversationViewSet(viewsets.ModelViewSet):
 class MessageViewSet(viewsets.ModelViewSet):
     """
     ViewSet for Message operations.
-    Provides endpoints to list, create, retrieve, update, and delete messages.
+    Provides endpoints to manage messages with proper access control.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsMessageOwner]
     lookup_field = 'message_id'
+    pagination_class = StandardResultsSetPagination
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['message_body']
+    ordering_fields = ['sent_at']
+    ordering = ['-sent_at']
     
     def get_queryset(self):
-        """
-        Return messages from conversations where the user is a participant.
-        Optionally filter by conversation_id.
-        """
+        """Return messages from conversations where user is a participant."""
         user = self.request.user
         queryset = Message.objects.filter(
             conversation__participants=user
         ).select_related('sender', 'conversation')
         
         # Filter by conversation if provided
-        conversation_id = self.request.query_params.get('conversation_id', None)
+        conversation_id = self.request.query_params.get('conversation_id')
         if conversation_id:
             queryset = queryset.filter(conversation__conversation_id=conversation_id)
         
-        return queryset.order_by('sent_at')
+        return queryset
     
     def get_serializer_class(self):
-        """
-        Use different serializers for create and read operations.
-        """
+        """Use different serializers for create and read operations."""
         if self.action == 'create':
             return MessageCreateSerializer
         return MessageSerializer
     
     def create(self, request, *args, **kwargs):
-        """
-        Send a new message to an existing conversation.
-        """
-        # Set the sender to the current user
-        data = request.data.copy()
-        data['sender'] = request.user.user_id
+        """Send a new message to a conversation."""
+        conversation_id = request.data.get('conversation')
         
-        serializer = MessageCreateSerializer(data=data)
-        serializer.is_valid(raise_exception=True)
-        
-        conversation_id = data.get('conversation')
-        
-        # Verify conversation exists
-        try:
-            conversation = Conversation.objects.get(conversation_id=conversation_id)
-        except Conversation.DoesNotExist:
-            return Response(
-                {'error': 'Conversation not found.'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        conversation = get_object_or_404(Conversation, conversation_id=conversation_id)
         
         # Verify user is a participant
-        if request.user not in conversation.participants.all():
+        if not conversation.participants.filter(user_id=request.user.user_id).exists():
             return Response(
-                {'error': 'You are not a participant in this conversation.'},
+                {'detail': 'You are not a participant in this conversation.'},
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        # Save the message
+        data = request.data.copy()
+        data['sender'] = request.user.user_id
+        
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
         message = serializer.save()
         
-        # Return with full message serialization
         output_serializer = MessageSerializer(message)
         return Response(output_serializer.data, status=status.HTTP_201_CREATED)
     
     def retrieve(self, request, *args, **kwargs):
-        """
-        Retrieve a specific message.
-        """
+        """Retrieve a specific message with permission check."""
         message = self.get_object()
-        
-        # Check if user is a participant in the conversation
-        if request.user not in message.conversation.participants.all():
-            return Response(
-                {'error': 'You do not have access to this message.'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
         serializer = self.get_serializer(message)
         return Response(serializer.data)
     
     def update(self, request, *args, **kwargs):
-        """
-        Update a message (only by the sender).
-        """
+        """Update a message (only sender can update)."""
         message = self.get_object()
         
-        # Only the sender can update the message
         if message.sender != request.user:
             return Response(
-                {'error': 'You can only update your own messages.'},
+                {'detail': 'You can only update your own messages.'},
                 status=status.HTTP_403_FORBIDDEN
             )
         
@@ -316,15 +265,12 @@ class MessageViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
     def destroy(self, request, *args, **kwargs):
-        """
-        Delete a message (only by the sender).
-        """
+        """Delete a message (only sender can delete)."""
         message = self.get_object()
         
-        # Only the sender can delete the message
         if message.sender != request.user:
             return Response(
-                {'error': 'You can only delete your own messages.'},
+                {'detail': 'You can only delete your own messages.'},
                 status=status.HTTP_403_FORBIDDEN
             )
         
@@ -333,52 +279,49 @@ class MessageViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def conversation_messages(self, request):
-        """
-        Get all messages for a specific conversation.
-        """
+        """Get all messages for a specific conversation."""
         conversation_id = request.query_params.get('conversation_id')
         
         if not conversation_id:
             return Response(
-                {'error': 'conversation_id parameter is required.'},
+                {'detail': 'conversation_id parameter is required.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        try:
-            conversation = Conversation.objects.get(conversation_id=conversation_id)
-        except Conversation.DoesNotExist:
-            return Response(
-                {'error': 'Conversation not found.'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+        conversation = get_object_or_404(Conversation, conversation_id=conversation_id)
         
-        # Check if user is a participant
-        if request.user not in conversation.participants.all():
+        # Check participation
+        if not conversation.participants.filter(user_id=request.user.user_id).exists():
             return Response(
-                {'error': 'You are not a participant in this conversation.'},
+                {'detail': 'You are not a participant in this conversation.'},
                 status=status.HTTP_403_FORBIDDEN
             )
         
         messages = self.get_queryset().filter(conversation=conversation)
+        page = self.paginate_queryset(messages)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        
         serializer = self.get_serializer(messages, many=True)
         return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
     def search(self, request):
-        """
-        Search messages by content.
-        """
-        query = request.query_params.get('q', '')
+        """Search messages by content."""
+        query = request.query_params.get('q', '').strip()
         
         if not query:
             return Response(
-                {'error': 'Search query (q) parameter is required.'},
+                {'detail': 'Search query (q) parameter is required.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        messages = self.get_queryset().filter(
-            message_body__icontains=query
-        )
+        messages = self.get_queryset().filter(message_body__icontains=query)
+        page = self.paginate_queryset(messages)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
         
         serializer = self.get_serializer(messages, many=True)
         return Response(serializer.data)
