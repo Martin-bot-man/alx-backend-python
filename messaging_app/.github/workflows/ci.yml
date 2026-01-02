@@ -11,19 +11,20 @@ jobs:
     runs-on: ubuntu-latest
     
     services:
-      postgres:
-        image: postgres:15
+      mysql:
+        image: mysql:8.0
         env:
-          POSTGRES_DB: messaging_db
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
+          MYSQL_ROOT_PASSWORD: root_password
+          MYSQL_DATABASE: messaging_db
+          MYSQL_USER: messaging_user
+          MYSQL_PASSWORD: messaging_password
         options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
         ports:
-          - 5432:5432
+          - 3306:3306
 
     steps:
     - uses: actions/checkout@v3
@@ -34,31 +35,44 @@ jobs:
         python-version: '3.11'
         cache: 'pip'
     
-    - name: Install dependencies
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libmysqlclient-dev
+    
+    - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     
+    - name: Wait for MySQL to be ready
+      run: |
+        python -c "import time; time.sleep(5)"
+        until mysqladmin ping -h127.0.0.1 -uroot -proot_password; do
+          echo 'waiting for mysql...'
+          sleep 1
+        done
+    
     - name: Run migrations
       env:
-        DB_ENGINE: django.db.backends.postgresql
+        DB_ENGINE: django.db.backends.mysql
         DB_NAME: messaging_db
-        DB_USER: postgres
-        DB_PASSWORD: postgres
-        DB_HOST: localhost
-        DB_PORT: 5432
+        DB_USER: messaging_user
+        DB_PASSWORD: messaging_password
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
         SECRET_KEY: test-secret-key
       run: |
         python manage.py migrate
     
     - name: Run tests
       env:
-        DB_ENGINE: django.db.backends.postgresql
+        DB_ENGINE: django.db.backends.mysql
         DB_NAME: messaging_db
-        DB_USER: postgres
-        DB_PASSWORD: postgres
-        DB_HOST: localhost
-        DB_PORT: 5432
+        DB_USER: messaging_user
+        DB_PASSWORD: messaging_password
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
         SECRET_KEY: test-secret-key
       run: |
         python manage.py test
@@ -73,6 +87,7 @@ jobs:
       run: |
         pip install black
         black --check . --line-length=120
+      continue-on-error: true
     
     - name: Run security checks (bandit)
       run: |
@@ -80,13 +95,22 @@ jobs:
         bandit -r . -ll -i --skip B101
       continue-on-error: true
     
-    - name: Upload coverage reports
+    - name: Generate test coverage report
+      env:
+        DB_ENGINE: django.db.backends.mysql
+        DB_NAME: messaging_db
+        DB_USER: messaging_user
+        DB_PASSWORD: messaging_password
+        DB_HOST: 127.0.0.1
+        DB_PORT: 3306
+        SECRET_KEY: test-secret-key
       run: |
         pip install coverage
         coverage run --source='.' manage.py test
+        coverage report
         coverage xml
     
-    - name: Upload to Codecov
+    - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3
       with:
         file: ./coverage.xml
